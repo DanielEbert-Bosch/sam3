@@ -40,10 +40,11 @@ def inverse_sigmoid(x, eps=1e-3):
 
 def get_sdpa_settings():
     if torch.cuda.is_available():
-        old_gpu = torch.cuda.get_device_properties(0).major < 7
+        major = torch.cuda.get_device_properties(0).major
+        old_gpu = major < 7
         # only use Flash Attention on Ampere (8.0) or newer GPUs
-        use_flash_attn = torch.cuda.get_device_properties(0).major >= 8
-        if not use_flash_attn:
+        use_flash_attn = major >= 8
+        if old_gpu:
             warnings.warn(
                 "Flash Attention is disabled as it requires a GPU with Ampere (8.0) CUDA capability.",
                 category=UserWarning,
@@ -395,7 +396,7 @@ def multi_head_attention_forward(
 
     if attn_type == AttentionType.Vanilla:
         if attn_mask is None and not is_causal and use_fa3:
-            from sam3.perflib.fa3 import flash_attn_func
+            from sam3.perflib.flash_attention import flash_attn_func
 
             assert dropout_p == 0.0
             attn_output = flash_attn_func(
@@ -696,6 +697,7 @@ class MultiheadAttention(nn.Module):
                     attn_type=self.attn_type,
                     attn_sparsity=self.sparsity,
                     attn_bias=attn_bias,
+                    use_fa3=self.use_fa3,
                 )
             else:
                 attn_output, attn_output_weights = multi_head_attention_forward(
@@ -720,6 +722,7 @@ class MultiheadAttention(nn.Module):
                     attn_type=self.attn_type,
                     attn_sparsity=self.sparsity,
                     attn_bias=attn_bias,
+                    use_fa3=self.use_fa3,
                 )
         if self.batch_first and is_batched:
             return attn_output.transpose(1, 0), attn_output_weights

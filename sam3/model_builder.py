@@ -2,10 +2,10 @@
 
 # pyre-unsafe
 
+import contextlib
 import os
 from typing import Optional
 
-import pkg_resources
 import torch
 import torch.nn as nn
 from huggingface_hub import hf_hub_download
@@ -61,6 +61,53 @@ def _setup_tf32() -> None:
 
 
 _setup_tf32()
+
+
+def _default_bpe_path() -> str:
+    """Locate the bundled BPE vocabulary.
+
+    Uses ``importlib.resources`` instead of ``pkg_resources``; merely importing
+    the latter costs ~0.2s of process startup.
+    """
+    from importlib.resources import files
+
+    return str(files("sam3") / "assets" / "bpe_simple_vocab_16e6.txt.gz")
+
+
+# Random-number fills used by the various ``reset_parameters`` implementations.
+# Every weight initializer in torch/timm bottoms out in one of these tensor
+# methods, so neutralizing them covers the whole module tree without having to
+# know which helper each submodule imported.
+_RNG_FILL_METHODS = ("uniform_", "normal_", "erfinv_")
+
+
+@contextlib.contextmanager
+def skip_weight_init():
+    """Turn random weight initialization into a no-op.
+
+    Building SAM3 spends several seconds filling ~1B parameters with random
+    values that the checkpoint overwrites immediately afterwards. Inside this
+    context parameters keep whatever ``torch.empty`` handed out, which is only
+    valid when *every* parameter is subsequently restored from a checkpoint --
+    ``_load_checkpoint`` verifies that and raises otherwise.
+    """
+    saved = {
+        name: torch.Tensor.__dict__.get(name, None) for name in _RNG_FILL_METHODS
+    }
+
+    def _noop(self, *args, **kwargs):
+        return self
+
+    try:
+        for name in _RNG_FILL_METHODS:
+            setattr(torch.Tensor, name, _noop)
+        yield
+    finally:
+        for name, original in saved.items():
+            if original is None:
+                delattr(torch.Tensor, name)
+            else:
+                setattr(torch.Tensor, name, original)
 
 
 def _create_position_encoding(precompute_resolution=None):
@@ -510,13 +557,15 @@ def _create_text_encoder(bpe_path: str) -> VETextEncoder:
 
 
 def _create_vision_backbone(
-    compile_mode=None, enable_inst_interactivity=True
+    compile_mode=None, enable_inst_interactivity=True, use_fa3=False
 ) -> Sam3DualViTDetNeck:
     """Create SAM3 visual backbone with ViT and neck."""
     # Position encoding
     position_encoding = _create_position_encoding(precompute_resolution=1008)
     # ViT backbone
-    vit_backbone: ViT = _create_vit_backbone(compile_mode=compile_mode)
+    vit_backbone: ViT = _create_vit_backbone(
+        compile_mode=compile_mode, use_fa3=use_fa3
+    )
     vit_neck: Sam3DualViTDetNeck = _create_vit_neck(
         position_encoding,
         vit_backbone,
@@ -536,10 +585,23 @@ def _create_sam3_transformer(
     return TransformerWrapper(encoder=encoder, decoder=decoder, d_model=256)
 
 
-def _load_checkpoint(model, checkpoint_path):
-    """Load model checkpoint from file."""
+def _torch_load(checkpoint_path):
+    """Load a checkpoint, memory-mapping it when it lives on a local filesystem.
+
+    ``mmap=True`` skips materializing the multi-GB tensor blob in RAM: pages are
+    faulted in lazily while ``load_state_dict`` copies them into the model.
+    """
+    if os.path.isfile(checkpoint_path):
+        return torch.load(
+            checkpoint_path, map_location="cpu", weights_only=True, mmap=True
+        )
     with g_pathmgr.open(checkpoint_path, "rb") as f:
-        ckpt = torch.load(f, map_location="cpu", weights_only=True)
+        return torch.load(f, map_location="cpu", weights_only=True)
+
+
+def _load_checkpoint(model, checkpoint_path, require_full_coverage=False):
+    """Load model checkpoint from file."""
+    ckpt = _torch_load(checkpoint_path)
     if "model" in ckpt and isinstance(ckpt["model"], dict):
         ckpt = ckpt["model"]
     sam3_image_ckpt = {
@@ -555,6 +617,13 @@ def _load_checkpoint(model, checkpoint_path):
         )
     missing_keys, _ = model.load_state_dict(sam3_image_ckpt, strict=False)
     if len(missing_keys) > 0:
+        if require_full_coverage:
+            # The model was built with uninitialized parameters, so anything the
+            # checkpoint does not provide would be garbage rather than random.
+            raise RuntimeError(
+                f"{checkpoint_path} does not cover every parameter, so the model "
+                f"cannot be built with skipped weight init:\n{missing_keys=}"
+            )
         print(
             f"loaded {checkpoint_path} and found "
             f"missing and/or unexpected keys:\n{missing_keys=}"
@@ -579,6 +648,8 @@ def build_sam3_image_model(
     enable_segmentation=True,
     enable_inst_interactivity=False,
     compile=False,
+    use_flash_attention=False,
+    fast_init=True,
 ):
     """
     Build SAM3 image model
@@ -591,62 +662,79 @@ def build_sam3_image_model(
         enable_segmentation: Whether to enable segmentation head
         enable_inst_interactivity: Whether to enable instance interactivity (SAM 1 task)
         compile_mode: To enable compilation, set to "default"
+        use_flash_attention: Use an installed FlashAttention implementation
+        fast_init: Allocate parameters straight on `device` and skip random
+            initialization when a checkpoint will overwrite every weight anyway.
+            Ignored when no checkpoint is loaded.
 
     Returns:
         A SAM3 image model
     """
     if bpe_path is None:
-        bpe_path = pkg_resources.resource_filename(
-            "sam3", "assets/bpe_simple_vocab_16e6.txt.gz"
+        bpe_path = _default_bpe_path()
+
+    will_load_checkpoint = checkpoint_path is not None or load_from_HF
+    fast_init = fast_init and will_load_checkpoint
+    # Building straight on the target device also removes the bulk host-to-device
+    # copy that `.cuda()` would otherwise perform on ~1B freshly allocated weights.
+    build_ctx = contextlib.ExitStack()
+    if fast_init:
+        build_ctx.enter_context(skip_weight_init())
+        build_ctx.enter_context(torch.device(device))
+
+    with build_ctx:
+        # Create visual components
+        compile_mode = "default" if compile else None
+        vision_encoder = _create_vision_backbone(
+            compile_mode=compile_mode,
+            enable_inst_interactivity=enable_inst_interactivity,
+            use_fa3=use_flash_attention,
         )
 
-    # Create visual components
-    compile_mode = "default" if compile else None
-    vision_encoder = _create_vision_backbone(
-        compile_mode=compile_mode, enable_inst_interactivity=enable_inst_interactivity
-    )
+        # Create text components
+        text_encoder = _create_text_encoder(bpe_path)
 
-    # Create text components
-    text_encoder = _create_text_encoder(bpe_path)
+        # Create visual-language backbone
+        backbone = _create_vl_backbone(vision_encoder, text_encoder)
 
-    # Create visual-language backbone
-    backbone = _create_vl_backbone(vision_encoder, text_encoder)
+        # Create transformer components
+        transformer = _create_sam3_transformer(use_fa3=use_flash_attention)
 
-    # Create transformer components
-    transformer = _create_sam3_transformer()
+        # Create dot product scoring
+        dot_prod_scoring = _create_dot_product_scoring()
 
-    # Create dot product scoring
-    dot_prod_scoring = _create_dot_product_scoring()
+        # Create segmentation head if enabled
+        segmentation_head = (
+            _create_segmentation_head(
+                compile_mode=compile_mode, use_fa3=use_flash_attention
+            )
+            if enable_segmentation
+            else None
+        )
 
-    # Create segmentation head if enabled
-    segmentation_head = (
-        _create_segmentation_head(compile_mode=compile_mode)
-        if enable_segmentation
-        else None
-    )
+        # Create geometry encoder
+        input_geometry_encoder = _create_geometry_encoder()
+        if enable_inst_interactivity:
+            sam3_pvs_base = build_tracker(apply_temporal_disambiguation=False)
+            inst_predictor = SAM3InteractiveImagePredictor(sam3_pvs_base)
+        else:
+            inst_predictor = None
+        # Create the SAM3 model
+        model = _create_sam3_model(
+            backbone,
+            transformer,
+            input_geometry_encoder,
+            segmentation_head,
+            dot_prod_scoring,
+            inst_predictor,
+            eval_mode,
+        )
 
-    # Create geometry encoder
-    input_geometry_encoder = _create_geometry_encoder()
-    if enable_inst_interactivity:
-        sam3_pvs_base = build_tracker(apply_temporal_disambiguation=False)
-        inst_predictor = SAM3InteractiveImagePredictor(sam3_pvs_base)
-    else:
-        inst_predictor = None
-    # Create the SAM3 model
-    model = _create_sam3_model(
-        backbone,
-        transformer,
-        input_geometry_encoder,
-        segmentation_head,
-        dot_prod_scoring,
-        inst_predictor,
-        eval_mode,
-    )
     if load_from_HF and checkpoint_path is None:
         checkpoint_path = download_ckpt_from_hf(version="sam3")
     # Load checkpoint if provided
     if checkpoint_path is not None:
-        _load_checkpoint(model, checkpoint_path)
+        _load_checkpoint(model, checkpoint_path, require_full_coverage=fast_init)
 
     # Setup device and mode
     model = _setup_device_and_mode(model, device, eval_mode)
@@ -695,9 +783,7 @@ def build_sam3_video_model(
         Sam3VideoInferenceWithInstanceInteractivity: The instantiated dense tracking model
     """
     if bpe_path is None:
-        bpe_path = pkg_resources.resource_filename(
-            "sam3", "assets/bpe_simple_vocab_16e6.txt.gz"
-        )
+        bpe_path = _default_bpe_path()
 
     # Build Tracker module
     tracker = build_tracker(apply_temporal_disambiguation=apply_temporal_disambiguation)
@@ -1105,9 +1191,7 @@ def build_sam3_multiplex_video_predictor(
         Sam3MultiplexVideoPredictor: The fully-initialized predictor
     """
     if bpe_path is None:
-        bpe_path = pkg_resources.resource_filename(
-            "sam3", "assets/bpe_simple_vocab_16e6.txt.gz"
-        )
+        bpe_path = _default_bpe_path()
 
     from sam3.model.sam3_multiplex_base import Sam3MultiplexPredictorWrapper
     from sam3.model.sam3_multiplex_detector import Sam3MultiplexDetector

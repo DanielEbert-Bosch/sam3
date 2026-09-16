@@ -415,14 +415,16 @@ class TransformerDecoder(nn.Module):
             assert deltas_x.shape[:3] == (bs, num_queries, W)
             assert deltas_y.shape[:3] == (bs, num_queries, H)
 
-        B = deltas_y.unsqueeze(3) + deltas_x.unsqueeze(
-            2
-        )  # bs, num_queries, H, W, n_heads
-        if not torch.compiler.is_dynamo_compiling():
-            assert B.shape[:4] == (bs, num_queries, H, W)
-        B = B.flatten(2, 3)  # bs, num_queries, H*W, n_heads
-        B = B.permute(0, 3, 1, 2)  # bs, n_heads, num_queries, H*W
-        B = B.contiguous()  # memeff attn likes ordered strides
+        # Move the head axis to the front *before* the outer sum. The sum below
+        # materializes bs*n_heads*num_queries*H*W elements, so broadcasting it
+        # straight into the layout the attention kernel expects avoids an extra
+        # transposed copy of that (multi-hundred-MB) tensor.
+        deltas_y = deltas_y.permute(0, 3, 1, 2)  # bs, n_heads, num_queries, H
+        deltas_x = deltas_x.permute(0, 3, 1, 2)  # bs, n_heads, num_queries, W
+        B = deltas_y.unsqueeze(-1) + deltas_x.unsqueeze(
+            -2
+        )  # bs, n_heads, num_queries, H, W
+        B = B.flatten(3)  # bs, n_heads, num_queries, H*W
         if not torch.compiler.is_dynamo_compiling():
             assert B.shape[2:] == (num_queries, H * W)
         return B
@@ -1054,7 +1056,7 @@ def functional_attention(
             )
 
     if use_fa3:
-        from sam3.perflib.fa3 import flash_attn_func
+        from sam3.perflib.flash_attention import flash_attn_func
 
         assert dropout == 0.0
         out = flash_attn_func(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))

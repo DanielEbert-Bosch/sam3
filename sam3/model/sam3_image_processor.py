@@ -11,6 +11,14 @@ from sam3.model.data_misc import FindStage, interpolate
 from torchvision.transforms import v2
 
 
+def _inference_dtype(device):
+    device = torch.device(device)
+    if device.type != "cuda":
+        return None
+    major, _ = torch.cuda.get_device_capability(device)
+    return torch.bfloat16 if major >= 8 else torch.float16
+
+
 class Sam3Processor:
     """ """
 
@@ -27,6 +35,7 @@ class Sam3Processor:
             ]
         )
         self.confidence_threshold = confidence_threshold
+        self.inference_dtype = _inference_dtype(device)
 
         self.find_stage = FindStage(
             img_ids=torch.tensor([0], device=device, dtype=torch.long),
@@ -36,6 +45,13 @@ class Sam3Processor:
             input_boxes_label=None,
             input_points=None,
             input_points_mask=None,
+        )
+
+    def _autocast(self):
+        return torch.autocast(
+            device_type=torch.device(self.device).type,
+            dtype=self.inference_dtype,
+            enabled=self.inference_dtype is not None,
         )
 
     @torch.inference_mode()
@@ -56,7 +72,8 @@ class Sam3Processor:
 
         state["original_height"] = height
         state["original_width"] = width
-        state["backbone_out"] = self.model.backbone.forward_image(image)
+        with self._autocast():
+            state["backbone_out"] = self.model.backbone.forward_image(image)
         inst_interactivity_en = self.model.inst_interactive_predictor is not None
         if inst_interactivity_en and "sam2_backbone_out" in state["backbone_out"]:
             sam2_backbone_out = state["backbone_out"]["sam2_backbone_out"]
@@ -94,7 +111,8 @@ class Sam3Processor:
         ]
         # pyrefly: ignore [bad-argument-type, bad-assignment]
         images = torch.stack(images, dim=0)
-        state["backbone_out"] = self.model.backbone.forward_image(images)
+        with self._autocast():
+            state["backbone_out"] = self.model.backbone.forward_image(images)
         inst_interactivity_en = self.model.inst_interactive_predictor is not None
         if inst_interactivity_en and "sam2_backbone_out" in state["backbone_out"]:
             sam2_backbone_out = state["backbone_out"]["sam2_backbone_out"]
@@ -117,13 +135,15 @@ class Sam3Processor:
         if "backbone_out" not in state:
             raise ValueError("You must call set_image before set_text_prompt")
 
-        text_outputs = self.model.backbone.forward_text([prompt], device=self.device)
+        with self._autocast():
+            text_outputs = self.model.backbone.forward_text([prompt], device=self.device)
         # will erase the previous text prompt if any
         state["backbone_out"].update(text_outputs)
         if "geometric_prompt" not in state:
             state["geometric_prompt"] = self.model._get_dummy_prompt()
 
-        return self._forward_grounding(state)
+        with self._autocast():
+            return self._forward_grounding(state)
 
     @torch.inference_mode()
     def add_geometric_prompt(self, box: List, label: bool, state: Dict):
@@ -137,9 +157,10 @@ class Sam3Processor:
 
         if "language_features" not in state["backbone_out"]:
             # Looks like we don't have a text prompt yet. This is allowed, but we need to set the text prompt to "visual" for the model to rely only on the geometric prompt
-            dummy_text_outputs = self.model.backbone.forward_text(
-                ["visual"], device=self.device
-            )
+            with self._autocast():
+                dummy_text_outputs = self.model.backbone.forward_text(
+                    ["visual"], device=self.device
+                )
             state["backbone_out"].update(dummy_text_outputs)
 
         if "geometric_prompt" not in state:
@@ -150,7 +171,8 @@ class Sam3Processor:
         labels = torch.tensor([label], device=self.device, dtype=torch.bool).view(1, 1)
         state["geometric_prompt"].append_boxes(boxes, labels)
 
-        return self._forward_grounding(state)
+        with self._autocast():
+            return self._forward_grounding(state)
 
     def reset_all_prompts(self, state: Dict):
         """Removes all the prompts and results"""

@@ -620,7 +620,7 @@ class Attention(nn.Module):
 
         if self.attn_type == AttentionType.Vanilla:
             if self.use_fa3:
-                from sam3.perflib.fa3 import flash_attn_func
+                from sam3.perflib.flash_attention import flash_attn_func
 
                 x = flash_attn_func(
                     q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
